@@ -5,6 +5,13 @@
 
 find_program(FYPP_EXE fypp REQUIRED)
 
+# Mixed precision forces the pack on: it doubles as the stp->wp conversion pass.
+if (MFC_WENO_PACK OR MFC_MIXED_PRECISION)
+    set(MFC_WENO_PACK_FYPP True)
+else()
+    set(MFC_WENO_PACK_FYPP False)
+endif()
+
 
 # HANDLE_SOURCES: Given a target (herein <target>):
 #
@@ -119,6 +126,7 @@ macro(HANDLE_SOURCES target useCommon)
                                  -D MFC_COMPILER="${CMAKE_Fortran_COMPILER_ID}"
 				                 -D MFC_CASE_OPTIMIZATION=False
                                  -D chemistry=False
+                                 -D MFC_WENO_PACK=${MFC_WENO_PACK_FYPP}
                                  --line-numbering
                                  --no-folding
 								 --line-length=999
