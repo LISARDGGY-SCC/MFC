@@ -117,7 +117,13 @@ contains
 
         call s_compute_weno_coefficients(1, is1_weno)
 
+#:if MFC_WENO_PACK
         @:ALLOCATE(v_rs_weno(is1_weno%beg:is1_weno%end, is2_weno%beg:is2_weno%end, is3_weno%beg:is3_weno%end, 1:sys_size))
+#:else
+        if (int_comp > 0) then
+            @:ALLOCATE(v_rs_weno(is1_weno%beg:is1_weno%end, is2_weno%beg:is2_weno%end, is3_weno%beg:is3_weno%end, 1:sys_size))
+        end if
+#:endif
 
         ! Allocating/Computing WENO Coefficients in y-direction
         if (n == 0) return
@@ -991,7 +997,14 @@ contains
         end if
 
         if (weno_order /= 1) then
+#:if MFC_WENO_PACK
             call s_pack_weno_input_arr(v_vf)
+#:else
+            ! THINC still consumes the packed array; pack only when it runs
+            if (int_comp > 0) then
+                call s_pack_weno_input_arr(v_vf)
+            end if
+#:endif
         end if
 
         if (weno_order == 3) then
@@ -1001,6 +1014,7 @@ contains
                      (3, 'z', 'l', 'j, k, {STENCIL_IDX}', 'is3_weno', 'is2_weno', 'is1_weno')]
                 #:set SV = STENCIL_VAR
                 #:set SF = lambda offs: COORDS.format(STENCIL_IDX = SV + offs)
+                #:set VS = lambda s: "v_rs_weno(" + s + ", i)" if MFC_WENO_PACK else "v_vf(i)%sf(" + s + ")"
                 if (weno_dir == ${WENO_DIR}$) then
                     $:GPU_PARALLEL_LOOP(collapse=4,private='[beta, dvd, poly, omega, alpha, tau, q, vp0, vp1, vm1]')
                     do l = ${Z_BND}$%beg, ${Z_BND}$%end
@@ -1011,9 +1025,9 @@ contains
 
                                     alpha(:) = 0._wp
 
-                                    vp0 = v_rs_weno(${SF('')}$, i)
-                                    vm1 = v_rs_weno(${SF(' - 1')}$, i)
-                                    vp1 = v_rs_weno(${SF(' + 1')}$, i)
+                                    vp0 = ${VS(SF(''))}$
+                                    vm1 = ${VS(SF(' - 1'))}$
+                                    vp1 = ${VS(SF(' + 1'))}$
 
                                     dvd(0) = vp1 - vp0
                                     dvd(-1) = vp0 - vm1
@@ -1092,6 +1106,7 @@ contains
                      (3, 'z', 'l', 'j, k, {STENCIL_IDX}', 'is3_weno', 'is2_weno', 'is1_weno')]
                     #:set SV = STENCIL_VAR
                     #:set SF = lambda offs: COORDS.format(STENCIL_IDX = SV + offs)
+                    #:set VS = lambda s: "v_rs_weno(" + s + ", i)" if MFC_WENO_PACK else "v_vf(i)%sf(" + s + ")"
                     if (weno_dir == ${WENO_DIR}$) then
                         $:GPU_PARALLEL_LOOP(collapse=3,private='[dvd, poly, beta, alpha, omega, tau, delta, q, vp0, vm1, vm2, &
                                             & vp1, vp2]')
@@ -1104,11 +1119,11 @@ contains
 
                                         alpha(:) = 0._wp
 
-                                        vp0 = v_rs_weno(${SF('')}$, i)
-                                        vm1 = v_rs_weno(${SF(' - 1')}$, i)
-                                        vm2 = v_rs_weno(${SF(' - 2')}$, i)
-                                        vp1 = v_rs_weno(${SF(' + 1')}$, i)
-                                        vp2 = v_rs_weno(${SF(' + 2')}$, i)
+                                        vp0 = ${VS(SF(''))}$
+                                        vm1 = ${VS(SF(' - 1'))}$
+                                        vm2 = ${VS(SF(' - 2'))}$
+                                        vp1 = ${VS(SF(' + 1'))}$
+                                        vp2 = ${VS(SF(' + 2'))}$
 
                                         dvd(1) = vp2 - vp1
                                         dvd(0) = vp1 - vp0
@@ -1237,7 +1252,11 @@ contains
                         $:END_GPU_PARALLEL_LOOP()
 
                         if (mp_weno) then
+#:if MFC_WENO_PACK
                             call s_preserve_monotonicity(v_rs_weno, vL_rs_vf_x, vR_rs_vf_x, weno_dir)
+#:else
+                            call s_preserve_monotonicity(v_vf, vL_rs_vf_x, vR_rs_vf_x, weno_dir)
+#:endif
                         end if
                     end if
                 #:endfor
@@ -1251,6 +1270,7 @@ contains
                      (3, 'z', 'l', 'j, k, {STENCIL_IDX}', 'is3_weno', 'is2_weno', 'is1_weno')]
                     #:set SV = STENCIL_VAR
                     #:set SF = lambda offs: COORDS.format(STENCIL_IDX = SV + offs)
+                    #:set VS = lambda s: "v_rs_weno(" + s + ", i)" if MFC_WENO_PACK else "v_vf(i)%sf(" + s + ")"
                     if (weno_dir == ${WENO_DIR}$) then
                         $:GPU_PARALLEL_LOOP(collapse=3,private='[poly, beta, alpha, omega, tau, delta, dvd, v, q, vp0, vp1, vp2, &
                                             & vp3, vm1, vm2, vm3]')
@@ -1261,13 +1281,13 @@ contains
                                     do i = 1, v_size
                                         alpha(:) = 0._wp
 
-                                        vp0 = v_rs_weno(${SF('')}$, i)
-                                        vm1 = v_rs_weno(${SF(' - 1')}$, i)
-                                        vm2 = v_rs_weno(${SF(' - 2')}$, i)
-                                        vm3 = v_rs_weno(${SF(' - 3')}$, i)
-                                        vp1 = v_rs_weno(${SF(' + 1')}$, i)
-                                        vp2 = v_rs_weno(${SF(' + 2')}$, i)
-                                        vp3 = v_rs_weno(${SF(' + 3')}$, i)
+                                        vp0 = ${VS(SF(''))}$
+                                        vm1 = ${VS(SF(' - 1'))}$
+                                        vm2 = ${VS(SF(' - 2'))}$
+                                        vm3 = ${VS(SF(' - 3'))}$
+                                        vp1 = ${VS(SF(' + 1'))}$
+                                        vp2 = ${VS(SF(' + 2'))}$
+                                        vp3 = ${VS(SF(' + 3'))}$
 
                                         if (teno) then
                                             v(-3) = vm3
@@ -1492,7 +1512,11 @@ contains
     !> Enforce monotonicity-preserving bounds on the WENO reconstruction
     subroutine s_preserve_monotonicity(v_rs_ws, vL_rs_vf, vR_rs_vf, weno_dir)
 
+#:if MFC_WENO_PACK
         real(wp), dimension(idwbuff(1)%beg:,idwbuff(2)%beg:,idwbuff(3)%beg:,1:), intent(in) :: v_rs_ws
+#:else
+        type(scalar_field), dimension(1:), intent(in) :: v_rs_ws
+#:endif
         real(wp), dimension(idwbuff(1)%beg:,idwbuff(2)%beg:,idwbuff(3)%beg:,1:), intent(inout) :: vL_rs_vf, vR_rs_vf
         integer, intent(in) :: weno_dir
         integer :: i, j, k, l
@@ -1517,6 +1541,7 @@ contains
                      (3, 'z', 'l', 'j, k, {STENCIL_IDX}', 'is3_weno', 'is2_weno', 'is1_weno')]
             #:set SV = STENCIL_VAR
             #:set SF = lambda offs: COORDS.format(STENCIL_IDX = SV + offs)
+            #:set VS = lambda s: "v_rs_ws(" + s + ", i)" if MFC_WENO_PACK else "v_rs_ws(i)%sf(" + s + ")"
             if (weno_dir == ${WENO_DIR}$) then
                 $:GPU_PARALLEL_LOOP(collapse=4,private='[d, vp0, vp1, vp2, vm1, vm2]')
                 do l = ${Z_BND}$%beg, ${Z_BND}$%end
@@ -1525,11 +1550,11 @@ contains
                             do i = 1, v_size
                                 ! Second-order undivided differences for curvature estimation
 
-                                vp0 = v_rs_ws(${SF('')}$, i)
-                                vm1 = v_rs_ws(${SF(' - 1')}$, i)
-                                vm2 = v_rs_ws(${SF(' - 2')}$, i)
-                                vp1 = v_rs_ws(${SF(' + 1')}$, i)
-                                vp2 = v_rs_ws(${SF(' + 2')}$, i)
+                                vp0 = ${VS(SF(''))}$
+                                vm1 = ${VS(SF(' - 1'))}$
+                                vm2 = ${VS(SF(' - 2'))}$
+                                vp1 = ${VS(SF(' + 1'))}$
+                                vp2 = ${VS(SF(' + 2'))}$
 
                                 d(-1) = vp0 + vm2 - vm1*2._wp
                                 d(0) = vp1 + vm1 - vp0*2._wp
@@ -1605,7 +1630,13 @@ contains
 
         ! Deallocating the WENO-stencil of the WENO-reconstructed variables
 
+#:if MFC_WENO_PACK
         @:DEALLOCATE(v_rs_weno)
+#:else
+        if (allocated(v_rs_weno)) then
+            @:DEALLOCATE(v_rs_weno)
+        end if
+#:endif
 
         ! Deallocating WENO coefficients in x-direction
         @:DEALLOCATE(poly_coef_cbL_x, poly_coef_cbR_x)
