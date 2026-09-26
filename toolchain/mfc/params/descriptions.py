@@ -150,6 +150,7 @@ DESCRIPTIONS = {
     "num_probes": "Number of probe points",
     # MPI/GPU
     "rdma_mpi": "Enable RDMA for MPI communication (GPUs)",
+    "halo_nonblocking": "Nonblocking halo exchange: overlap the two faces of each direction via Isend/Irecv + Waitall",
     # Misc
     "case_dir": "Case directory path",
     "files_dir": "The relative path to the directory containing the extrusion IC files",

@@ -399,6 +399,7 @@ contains
         ic_eps = dflt_ic_eps
         ic_beta = dflt_ic_beta
         rdma_mpi = .false.
+        halo_nonblocking = .false.
         shear_stress = .false.
         bulk_stress = .false.
         any_non_newtonian = .false.

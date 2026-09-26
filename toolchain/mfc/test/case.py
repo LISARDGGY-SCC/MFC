@@ -130,6 +130,7 @@ BASE_CFG = {
     "acoustic(1)%npulse": 1,
     "acoustic(1)%pulse": 1,
     "rdma_mpi": "F",
+    "halo_nonblocking": "F",
     "bubbles_lagrange": "F",
     "lag_params%nBubs_glb": 1,
     "lag_params%solver_approach": 0,
