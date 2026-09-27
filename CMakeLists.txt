@@ -31,6 +31,7 @@ option(MFC_DOCUMENTATION "Build documentation"                               OFF
 option(MFC_ALL           "Build everything"                                  OFF)
 option(MFC_SINGLE_PRECISION "Build single precision"                         OFF)
 option(MFC_MIXED_PRECISION "Build mixed precision"                           OFF)
+option(MFC_WENO_PACK    "Pack WENO input into v_rs_weno (upstream behavior)" ON)
 
 if (MFC_ALL)
     set(MFC_PRE_PROCESS   ON FORCE)
