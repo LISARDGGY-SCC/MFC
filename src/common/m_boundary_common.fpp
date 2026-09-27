@@ -96,24 +96,65 @@ contains
         type(integer_field), dimension(1:num_dims,1:2), intent(in)                                           :: bc_type
         type(scalar_field), optional, intent(inout)                                                          :: q_T_sf
 
-        call s_populate_bc_direction(1, -1, bc_x, bc_type(1, 1), q_prim_vf, pb_in, mv_in, q_T_sf)
-        call s_populate_bc_direction(1, 1, bc_x, bc_type(1, 2), q_prim_vf, pb_in, mv_in, q_T_sf)
+        if (use_halo_nonblocking) then
+            call s_populate_bc_direction_nb(1, bc_x, bc_type(1, 1), bc_type(1, 2), q_prim_vf, pb_in, mv_in, q_T_sf)
+        else
+            call s_populate_bc_direction(1, -1, bc_x, bc_type(1, 1), q_prim_vf, pb_in, mv_in, q_T_sf)
+            call s_populate_bc_direction(1, 1, bc_x, bc_type(1, 2), q_prim_vf, pb_in, mv_in, q_T_sf)
+        end if
 
         if (n == 0) return
 
         #:if not MFC_CASE_OPTIMIZATION or num_dims > 1
-            call s_populate_bc_direction(2, -1, bc_y, bc_type(2, 1), q_prim_vf, pb_in, mv_in, q_T_sf)
-            call s_populate_bc_direction(2, 1, bc_y, bc_type(2, 2), q_prim_vf, pb_in, mv_in, q_T_sf)
+            if (use_halo_nonblocking) then
+                call s_populate_bc_direction_nb(2, bc_y, bc_type(2, 1), bc_type(2, 2), q_prim_vf, pb_in, mv_in, q_T_sf)
+            else
+                call s_populate_bc_direction(2, -1, bc_y, bc_type(2, 1), q_prim_vf, pb_in, mv_in, q_T_sf)
+                call s_populate_bc_direction(2, 1, bc_y, bc_type(2, 2), q_prim_vf, pb_in, mv_in, q_T_sf)
+            end if
         #:endif
 
         if (p == 0) return
 
         #:if not MFC_CASE_OPTIMIZATION or num_dims > 2
-            call s_populate_bc_direction(3, -1, bc_z, bc_type(3, 1), q_prim_vf, pb_in, mv_in, q_T_sf)
-            call s_populate_bc_direction(3, 1, bc_z, bc_type(3, 2), q_prim_vf, pb_in, mv_in, q_T_sf)
+            if (use_halo_nonblocking) then
+                call s_populate_bc_direction_nb(3, bc_z, bc_type(3, 1), bc_type(3, 2), q_prim_vf, pb_in, mv_in, q_T_sf)
+            else
+                call s_populate_bc_direction(3, -1, bc_z, bc_type(3, 1), q_prim_vf, pb_in, mv_in, q_T_sf)
+                call s_populate_bc_direction(3, 1, bc_z, bc_type(3, 2), q_prim_vf, pb_in, mv_in, q_T_sf)
+            end if
         #:endif
 
     end subroutine s_populate_variables_buffers
+
+    !> Populate the variable buffers along one direction, exchanging both faces nonblocking when they are processor
+    !! boundaries (halo_nonblocking) and keeping the local per-cell BC path for physical boundary faces. Directions are
+    !! driven in x, y, z order by the caller and each direction's faces are finalized together, matching the blocking
+    !! path's data flow so results are unchanged.
+    impure subroutine s_populate_bc_direction_nb(bc_dir, bc_bounds, bc_type_beg, bc_type_end, q_prim_vf, pb_in, mv_in, q_T_sf)
+
+        integer, intent(in)                                                                                :: bc_dir
+        type(int_bounds_info), intent(in)                                                                  :: bc_bounds
+        type(integer_field), intent(in)                                                                    :: bc_type_beg, bc_type_end
+        type(scalar_field), dimension(sys_size), intent(inout)                                             :: q_prim_vf
+        real(stp), optional, dimension(idwbuff(1)%beg:,idwbuff(2)%beg:,idwbuff(3)%beg:,1:,1:), intent(inout) :: pb_in, mv_in
+        type(scalar_field), optional, intent(inout)                                                        :: q_T_sf
+        logical                                                                                            :: face_is_mpi(1:2)
+
+        face_is_mpi(1) = bc_bounds%beg >= 0
+        face_is_mpi(2) = bc_bounds%end >= 0
+
+        if (any(face_is_mpi)) then
+            call s_mpi_nb_direction_buffers(q_prim_vf, bc_dir, sys_size, face_is_mpi, pb_in, mv_in, q_T_sf)
+        end if
+        if (.not. face_is_mpi(1)) then
+            call s_populate_bc_direction(bc_dir, -1, bc_bounds, bc_type_beg, q_prim_vf, pb_in, mv_in, q_T_sf)
+        end if
+        if (.not. face_is_mpi(2)) then
+            call s_populate_bc_direction(bc_dir, 1, bc_bounds, bc_type_end, q_prim_vf, pb_in, mv_in, q_T_sf)
+        end if
+
+    end subroutine s_populate_bc_direction_nb
 
     !> Populate the variable buffers along one direction and location, via MPI exchange for processor boundaries or by dispatching
     !! the per-cell BC routines over the boundary face.

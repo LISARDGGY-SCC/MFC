@@ -44,17 +44,24 @@ module m_mpi_common
 
     logical, private :: exchange_all_chemistry_temperatures = .false.
     logical, private :: use_rdma_transport = .false.
+    !> Per-direction nonblocking halo exchange (case param halo_nonblocking); .false. keeps the blocking Sendrecv path
+    logical            :: use_halo_nonblocking = .false.
 
 contains
 
     !> Initialize the module.
-    impure subroutine s_initialize_mpi_common_module(exchange_all_chemistry_temperatures_in, use_rdma_transport_in)
+    impure subroutine s_initialize_mpi_common_module(exchange_all_chemistry_temperatures_in, use_rdma_transport_in, &
+                                                     & use_halo_nonblocking_in)
 
-        logical, intent(in) :: exchange_all_chemistry_temperatures_in
-        logical, intent(in) :: use_rdma_transport_in
+        logical, intent(in)           :: exchange_all_chemistry_temperatures_in
+        logical, intent(in)           :: use_rdma_transport_in
+        logical, intent(in), optional :: use_halo_nonblocking_in
+        integer(kind=8)               :: halo_alloc
 
         exchange_all_chemistry_temperatures = exchange_all_chemistry_temperatures_in
         use_rdma_transport = use_rdma_transport_in
+        use_halo_nonblocking = .false.
+        if (present(use_halo_nonblocking_in)) use_halo_nonblocking = use_halo_nonblocking_in
 
 #ifdef MFC_MPI
         ! Allocating buff_send/recv and. Please note that for the sake of simplicity, both variables are provided sufficient storage
@@ -79,12 +86,19 @@ contains
             halo_size = -1 + buff_size*(v_size)
         end if
 
+        ! Nonblocking exchange assigns each of the 6 faces a private segment of halo_size + 1 elements
+        if (use_halo_nonblocking) then
+            halo_alloc = 6*(halo_size + 1) - 1
+        else
+            halo_alloc = halo_size
+        end if
+
         $:GPU_UPDATE(device='[halo_size, v_size]')
 
 #ifndef __NVCOMPILER_GPU_UNIFIED_MEM
-        @:ALLOCATE(buff_send(0:halo_size), buff_recv(0:halo_size))
+        @:ALLOCATE(buff_send(0:halo_alloc), buff_recv(0:halo_alloc))
 #else
-        allocate (buff_send(0:halo_size), buff_recv(0:halo_size))
+        allocate (buff_send(0:halo_alloc), buff_recv(0:halo_alloc))
         $:GPU_ENTER_DATA(create='[capture:buff_send]')
         $:GPU_ENTER_DATA(create='[capture:buff_recv]')
 #endif
@@ -547,26 +561,20 @@ contains
 
     end subroutine s_mpi_finalize
 
-    !> The goal of this procedure is to populate the buffers of the cell-average conservative variables by communicating with the
-    !! neighboring processors.
-    subroutine s_mpi_sendrecv_variables_buffers(q_comm, mpi_dir, pbc_loc, nVar, pb_in, mv_in, q_T_sf)
+    !> Per-face halo exchange metadata shared by the blocking and nonblocking transports: payload flags and size, face
+    !! partner ranks and tags, and the in-grid pack/unpack slab offsets.
+    subroutine s_mpi_setup_face_exchange(nVar, mpi_dir, pbc_loc, qbmm_comm, chem_diff_comm, buffer_count, dst_proc, src_proc, &
+                                         & send_tag, recv_tag, pack_offset, unpack_offset, pb_in, mv_in, q_T_sf)
 
-        type(scalar_field), dimension(1:), intent(inout) :: q_comm
-        real(stp), optional, dimension(idwbuff(1)%beg:,idwbuff(2)%beg:,idwbuff(3)%beg:,1:,1:), intent(inout) :: pb_in, mv_in
-        integer, intent(in) :: mpi_dir, pbc_loc, nVar
-        integer :: i, j, k, l, r, q  !< Generic loop iterators
-        integer :: buffer_counts(1:3), buffer_count
+        integer, intent(in) :: nVar, mpi_dir, pbc_loc
+        logical, intent(out) :: qbmm_comm, chem_diff_comm
+        integer, intent(out) :: buffer_count, dst_proc, src_proc, send_tag, recv_tag, pack_offset, unpack_offset
+        real(stp), optional, dimension(idwbuff(1)%beg:,idwbuff(2)%beg:,idwbuff(3)%beg:,1:,1:), intent(in) :: pb_in, mv_in
+        type(scalar_field), optional, intent(in) :: q_T_sf
+        integer :: buffer_counts(1:3)
         type(int_bounds_info) :: boundary_conditions(1:3)
         integer :: beg_end(1:2), grid_dims(1:3)
-        integer :: dst_proc, src_proc, recv_tag, send_tag
-        logical :: beg_end_geq_0, qbmm_comm, chem_diff_comm
-        integer :: pack_offset, unpack_offset
-        type(scalar_field), optional, intent(inout) :: q_T_sf
-
-#ifdef MFC_MPI
-        integer :: ierr  !< Generic flag used to identify and report MPI errors
-
-        call nvtxStartRange("RHS-COMM-PACKBUF")
+        logical :: beg_end_geq_0
 
         qbmm_comm = .false.
         chem_diff_comm = .false.
@@ -620,6 +628,21 @@ contains
             unpack_offset = grid_dims(mpi_dir) + buff_size + 1
         end if
 
+    end subroutine s_mpi_setup_face_exchange
+
+    !> Pack the send buffer for one face; r_off places the payload at the face's private segment offset
+    !! (0 for the shared blocking-path segment). Packed bytes per face are identical in both paths.
+    subroutine s_mpi_pack_face_buffer(q_comm, mpi_dir, pack_offset, nVar, r_off, qbmm_comm, chem_diff_comm, pb_in, mv_in, q_T_sf)
+
+        type(scalar_field), dimension(1:), intent(inout) :: q_comm
+        real(stp), optional, dimension(idwbuff(1)%beg:,idwbuff(2)%beg:,idwbuff(3)%beg:,1:,1:), intent(inout) :: pb_in, mv_in
+        integer, intent(in) :: mpi_dir, pack_offset, nVar, r_off
+        logical, intent(in) :: qbmm_comm, chem_diff_comm
+        type(scalar_field), optional, intent(inout) :: q_T_sf
+        integer :: i, j, k, l, r, q  !< Generic loop iterators
+
+        call nvtxStartRange("RHS-COMM-PACKBUF")
+
         ! Pack Buffer to Send
         #:for mpi_dir in [1, 2, 3]
             if (mpi_dir == ${mpi_dir}$) then
@@ -629,7 +652,7 @@ contains
                         do k = 0, n
                             do j = 0, buff_size - 1
                                 do i = 1, nVar
-                                    r = (i - 1) + v_size*(j + buff_size*(k + (n + 1)*l))
+                                    r = r_off + (i - 1) + v_size*(j + buff_size*(k + (n + 1)*l))
                                     buff_send(r) = real(q_comm(i)%sf(j + pack_offset, k, l), kind=wp)
                                 end do
                             end do
@@ -642,7 +665,7 @@ contains
                         do l = 0, p
                             do k = 0, n
                                 do j = 0, buff_size - 1
-                                    r = nVar + v_size*(j + buff_size*(k + (n + 1)*l))
+                                    r = r_off + nVar + v_size*(j + buff_size*(k + (n + 1)*l))
                                     buff_send(r) = real(q_T_sf%sf(j + pack_offset, k, l), kind=wp)
                                 end do
                             end do
@@ -657,7 +680,7 @@ contains
                                 do j = 0, buff_size - 1
                                     do i = nVar + 1, nVar + nnode
                                         do q = 1, nb
-                                            r = (i - 1) + (q - 1)*nnode + v_size*(j + buff_size*(k + (n + 1)*l))
+                                            r = r_off + (i - 1) + (q - 1)*nnode + v_size*(j + buff_size*(k + (n + 1)*l))
                                             buff_send(r) = real(pb_in(j + pack_offset, k, l, i - nVar, q), kind=wp)
                                         end do
                                     end do
@@ -672,7 +695,7 @@ contains
                                 do j = 0, buff_size - 1
                                     do i = nVar + 1, nVar + nnode
                                         do q = 1, nb
-                                            r = (i - 1) + (q - 1)*nnode + nb*nnode + v_size*(j + buff_size*(k + (n + 1)*l))
+                                            r = r_off + (i - 1) + (q - 1)*nnode + nb*nnode + v_size*(j + buff_size*(k + (n + 1)*l))
                                             buff_send(r) = real(mv_in(j + pack_offset, k, l, i - nVar, q), kind=wp)
                                         end do
                                     end do
@@ -687,7 +710,7 @@ contains
                         do l = 0, p
                             do k = 0, buff_size - 1
                                 do j = -buff_size, m + buff_size
-                                    r = (i - 1) + v_size*((j + buff_size) + (m + 2*buff_size + 1)*(k + buff_size*l))
+                                    r = r_off + (i - 1) + v_size*((j + buff_size) + (m + 2*buff_size + 1)*(k + buff_size*l))
                                     buff_send(r) = real(q_comm(i)%sf(j, k + pack_offset, l), kind=wp)
                                 end do
                             end do
@@ -700,7 +723,7 @@ contains
                         do l = 0, p
                             do k = 0, buff_size - 1
                                 do j = -buff_size, m + buff_size
-                                    r = nVar + v_size*((j + buff_size) + (m + 2*buff_size + 1)*(k + buff_size*l))
+                                    r = r_off + nVar + v_size*((j + buff_size) + (m + 2*buff_size + 1)*(k + buff_size*l))
                                     buff_send(r) = real(q_T_sf%sf(j, k + pack_offset, l), kind=wp)
                                 end do
                             end do
@@ -715,7 +738,7 @@ contains
                                 do k = 0, buff_size - 1
                                     do j = -buff_size, m + buff_size
                                         do q = 1, nb
-                                            r = (i - 1) + (q - 1)*nnode + v_size*((j + buff_size) + (m + 2*buff_size + 1)*(k &
+                                            r = r_off + (i - 1) + (q - 1)*nnode + v_size*((j + buff_size) + (m + 2*buff_size + 1)*(k &
                                                  & + buff_size*l))
                                             buff_send(r) = real(pb_in(j, k + pack_offset, l, i - nVar, q), kind=wp)
                                         end do
@@ -731,7 +754,7 @@ contains
                                 do k = 0, buff_size - 1
                                     do j = -buff_size, m + buff_size
                                         do q = 1, nb
-                                            r = (i - 1) + (q - 1)*nnode + nb*nnode + v_size*((j + buff_size) + (m + 2*buff_size &
+                                            r = r_off + (i - 1) + (q - 1)*nnode + nb*nnode + v_size*((j + buff_size) + (m + 2*buff_size &
                                                  & + 1)*(k + buff_size*l))
                                             buff_send(r) = real(mv_in(j, k + pack_offset, l, i - nVar, q), kind=wp)
                                         end do
@@ -747,7 +770,7 @@ contains
                         do l = 0, buff_size - 1
                             do k = -buff_size, n + buff_size
                                 do j = -buff_size, m + buff_size
-                                    r = (i - 1) + v_size*((j + buff_size) + (m + 2*buff_size + 1)*((k + buff_size) + (n &
+                                    r = r_off + (i - 1) + v_size*((j + buff_size) + (m + 2*buff_size + 1)*((k + buff_size) + (n &
                                          & + 2*buff_size + 1)*l))
                                     buff_send(r) = real(q_comm(i)%sf(j, k, l + pack_offset), kind=wp)
                                 end do
@@ -761,7 +784,7 @@ contains
                         do l = 0, buff_size - 1
                             do k = -buff_size, n + buff_size
                                 do j = -buff_size, m + buff_size
-                                    r = nVar + v_size*((j + buff_size) + (m + 2*buff_size + 1)*((k + buff_size) + (n &
+                                    r = r_off + nVar + v_size*((j + buff_size) + (m + 2*buff_size + 1)*((k + buff_size) + (n &
                                                        & + 2*buff_size + 1)*l))
                                     buff_send(r) = real(q_T_sf%sf(j, k, l + pack_offset), kind=wp)
                                 end do
@@ -777,7 +800,7 @@ contains
                                 do k = -buff_size, n + buff_size
                                     do j = -buff_size, m + buff_size
                                         do q = 1, nb
-                                            r = (i - 1) + (q - 1)*nnode + v_size*((j + buff_size) + (m + 2*buff_size + 1)*((k &
+                                            r = r_off + (i - 1) + (q - 1)*nnode + v_size*((j + buff_size) + (m + 2*buff_size + 1)*((k &
                                                  & + buff_size) + (n + 2*buff_size + 1)*l))
                                             buff_send(r) = real(pb_in(j, k, l + pack_offset, i - nVar, q), kind=wp)
                                         end do
@@ -793,7 +816,7 @@ contains
                                 do k = -buff_size, n + buff_size
                                     do j = -buff_size, m + buff_size
                                         do q = 1, nb
-                                            r = (i - 1) + (q - 1)*nnode + nb*nnode + v_size*((j + buff_size) + (m + 2*buff_size &
+                                            r = r_off + (i - 1) + (q - 1)*nnode + nb*nnode + v_size*((j + buff_size) + (m + 2*buff_size &
                                                  & + 1)*((k + buff_size) + (n + 2*buff_size + 1)*l))
                                             buff_send(r) = real(mv_in(j, k, l + pack_offset, i - nVar, q), kind=wp)
                                         end do
@@ -807,6 +830,29 @@ contains
             end if
         #:endfor
         call nvtxEndRange  ! Packbuf
+
+    end subroutine s_mpi_pack_face_buffer
+
+    !> The goal of this procedure is to populate the buffers of the cell-average conservative variables by communicating with the
+    !! neighboring processors.
+    subroutine s_mpi_sendrecv_variables_buffers(q_comm, mpi_dir, pbc_loc, nVar, pb_in, mv_in, q_T_sf)
+
+        type(scalar_field), dimension(1:), intent(inout) :: q_comm
+        real(stp), optional, dimension(idwbuff(1)%beg:,idwbuff(2)%beg:,idwbuff(3)%beg:,1:,1:), intent(inout) :: pb_in, mv_in
+        integer, intent(in) :: mpi_dir, pbc_loc, nVar
+        integer :: buffer_count
+        integer :: dst_proc, src_proc, recv_tag, send_tag
+        logical :: qbmm_comm, chem_diff_comm
+        integer :: pack_offset, unpack_offset
+        type(scalar_field), optional, intent(inout) :: q_T_sf
+
+#ifdef MFC_MPI
+        integer :: ierr  !< Generic flag used to identify and report MPI errors
+
+        call s_mpi_setup_face_exchange(nVar, mpi_dir, pbc_loc, qbmm_comm, chem_diff_comm, buffer_count, dst_proc, src_proc, &
+                                       & send_tag, recv_tag, pack_offset, unpack_offset, pb_in, mv_in, q_T_sf)
+
+        call s_mpi_pack_face_buffer(q_comm, mpi_dir, pack_offset, nVar, 0, qbmm_comm, chem_diff_comm, pb_in, mv_in, q_T_sf)
 
         ! Send/Recv
         #:for rdma_mpi in [False, True]
@@ -839,6 +885,23 @@ contains
             end if
         #:endfor
 
+        call s_mpi_unpack_face_buffer(q_comm, mpi_dir, unpack_offset, nVar, 0, qbmm_comm, chem_diff_comm, pb_in, mv_in, q_T_sf)
+#endif
+
+    end subroutine s_mpi_sendrecv_variables_buffers
+
+    !> Unpack the receive buffer for one face; r_off selects the face's private segment (0 for the shared blocking-path
+    !! segment). Written ghost values are identical in both paths.
+    subroutine s_mpi_unpack_face_buffer(q_comm, mpi_dir, unpack_offset, nVar, r_off, qbmm_comm, chem_diff_comm, pb_in, mv_in, &
+                                        & q_T_sf)
+
+        type(scalar_field), dimension(1:), intent(inout) :: q_comm
+        real(stp), optional, dimension(idwbuff(1)%beg:,idwbuff(2)%beg:,idwbuff(3)%beg:,1:,1:), intent(inout) :: pb_in, mv_in
+        integer, intent(in) :: mpi_dir, unpack_offset, nVar, r_off
+        logical, intent(in) :: qbmm_comm, chem_diff_comm
+        type(scalar_field), optional, intent(inout) :: q_T_sf
+        integer :: i, j, k, l, r, q  !< Generic loop iterators
+
         ! Unpack Received Buffer
         call nvtxStartRange("RHS-COMM-UNPACKBUF")
         #:for mpi_dir in [1, 2, 3]
@@ -849,7 +912,7 @@ contains
                         do k = 0, n
                             do j = -buff_size, -1
                                 do i = 1, nVar
-                                    r = (i - 1) + v_size*(j + buff_size*((k + 1) + (n + 1)*l))
+                                    r = r_off + (i - 1) + v_size*(j + buff_size*((k + 1) + (n + 1)*l))
                                     q_comm(i)%sf(j + unpack_offset, k, l) = real(buff_recv(r), kind=stp)
 #if defined(__INTEL_COMPILER)
                                     if (ieee_is_nan(q_comm(i)%sf(j + unpack_offset, k, l))) then
@@ -868,7 +931,7 @@ contains
                         do l = 0, p
                             do k = 0, n
                                 do j = -buff_size, -1
-                                    r = nVar + v_size*(j + buff_size*((k + 1) + (n + 1)*l))
+                                    r = r_off + nVar + v_size*(j + buff_size*((k + 1) + (n + 1)*l))
                                     q_T_sf%sf(j + unpack_offset, k, l) = real(buff_recv(r), kind=stp)
 #if defined(__INTEL_COMPILER)
                                     if (ieee_is_nan(q_T_sf%sf(j + unpack_offset, k, l))) then
@@ -889,7 +952,7 @@ contains
                                 do j = -buff_size, -1
                                     do i = nVar + 1, nVar + nnode
                                         do q = 1, nb
-                                            r = (i - 1) + (q - 1)*nnode + v_size*(j + buff_size*((k + 1) + (n + 1)*l))
+                                            r = r_off + (i - 1) + (q - 1)*nnode + v_size*(j + buff_size*((k + 1) + (n + 1)*l))
                                             pb_in(j + unpack_offset, k, l, i - nVar, q) = real(buff_recv(r), kind=stp)
                                         end do
                                     end do
@@ -904,7 +967,7 @@ contains
                                 do j = -buff_size, -1
                                     do i = nVar + 1, nVar + nnode
                                         do q = 1, nb
-                                            r = (i - 1) + (q - 1)*nnode + nb*nnode + v_size*(j + buff_size*((k + 1) + (n + 1)*l))
+                                            r = r_off + (i - 1) + (q - 1)*nnode + nb*nnode + v_size*(j + buff_size*((k + 1) + (n + 1)*l))
                                             mv_in(j + unpack_offset, k, l, i - nVar, q) = real(buff_recv(r), kind=stp)
                                         end do
                                     end do
@@ -919,7 +982,7 @@ contains
                         do l = 0, p
                             do k = -buff_size, -1
                                 do j = -buff_size, m + buff_size
-                                    r = (i - 1) + v_size*((j + buff_size) + (m + 2*buff_size + 1)*((k + buff_size) + buff_size*l))
+                                    r = r_off + (i - 1) + v_size*((j + buff_size) + (m + 2*buff_size + 1)*((k + buff_size) + buff_size*l))
                                     q_comm(i)%sf(j, k + unpack_offset, l) = real(buff_recv(r), kind=stp)
 #if defined(__INTEL_COMPILER)
                                     if (ieee_is_nan(q_comm(i)%sf(j, k + unpack_offset, l))) then
@@ -938,7 +1001,7 @@ contains
                         do l = 0, p
                             do k = -buff_size, -1
                                 do j = -buff_size, m + buff_size
-                                    r = nVar + v_size*((j + buff_size) + (m + 2*buff_size + 1)*((k + buff_size) + buff_size*l))
+                                    r = r_off + nVar + v_size*((j + buff_size) + (m + 2*buff_size + 1)*((k + buff_size) + buff_size*l))
                                     q_T_sf%sf(j, k + unpack_offset, l) = real(buff_recv(r), kind=stp)
 #if defined(__INTEL_COMPILER)
                                     if (ieee_is_nan(q_T_sf%sf(j, k + unpack_offset, l))) then
@@ -959,7 +1022,7 @@ contains
                                 do k = -buff_size, -1
                                     do j = -buff_size, m + buff_size
                                         do q = 1, nb
-                                            r = (i - 1) + (q - 1)*nnode + v_size*((j + buff_size) + (m + 2*buff_size + 1)*((k &
+                                            r = r_off + (i - 1) + (q - 1)*nnode + v_size*((j + buff_size) + (m + 2*buff_size + 1)*((k &
                                                  & + buff_size) + buff_size*l))
                                             pb_in(j, k + unpack_offset, l, i - nVar, q) = real(buff_recv(r), kind=stp)
                                         end do
@@ -975,7 +1038,7 @@ contains
                                 do k = -buff_size, -1
                                     do j = -buff_size, m + buff_size
                                         do q = 1, nb
-                                            r = (i - 1) + (q - 1)*nnode + nb*nnode + v_size*((j + buff_size) + (m + 2*buff_size &
+                                            r = r_off + (i - 1) + (q - 1)*nnode + nb*nnode + v_size*((j + buff_size) + (m + 2*buff_size &
                                                  & + 1)*((k + buff_size) + buff_size*l))
                                             mv_in(j, k + unpack_offset, l, i - nVar, q) = real(buff_recv(r), kind=stp)
                                         end do
@@ -991,7 +1054,7 @@ contains
                         do l = -buff_size, -1
                             do k = -buff_size, n + buff_size
                                 do j = -buff_size, m + buff_size
-                                    r = (i - 1) + v_size*((j + buff_size) + (m + 2*buff_size + 1)*((k + buff_size) + (n &
+                                    r = r_off + (i - 1) + v_size*((j + buff_size) + (m + 2*buff_size + 1)*((k + buff_size) + (n &
                                          & + 2*buff_size + 1)*(l + buff_size)))
                                     q_comm(i)%sf(j, k, l + unpack_offset) = real(buff_recv(r), kind=stp)
 #if defined(__INTEL_COMPILER)
@@ -1011,7 +1074,7 @@ contains
                         do l = -buff_size, -1
                             do k = -buff_size, n + buff_size
                                 do j = -buff_size, m + buff_size
-                                    r = nVar + v_size*((j + buff_size) + (m + 2*buff_size + 1)*((k + buff_size) + (n &
+                                    r = r_off + nVar + v_size*((j + buff_size) + (m + 2*buff_size + 1)*((k + buff_size) + (n &
                                                        & + 2*buff_size + 1)*(l + buff_size)))
                                     q_T_sf%sf(j, k, l + unpack_offset) = real(buff_recv(r), kind=stp)
 #if defined(__INTEL_COMPILER)
@@ -1033,7 +1096,7 @@ contains
                                 do k = -buff_size, n + buff_size
                                     do j = -buff_size, m + buff_size
                                         do q = 1, nb
-                                            r = (i - 1) + (q - 1)*nnode + v_size*((j + buff_size) + (m + 2*buff_size + 1)*((k &
+                                            r = r_off + (i - 1) + (q - 1)*nnode + v_size*((j + buff_size) + (m + 2*buff_size + 1)*((k &
                                                  & + buff_size) + (n + 2*buff_size + 1)*(l + buff_size)))
                                             pb_in(j, k, l + unpack_offset, i - nVar, q) = real(buff_recv(r), kind=stp)
                                         end do
@@ -1049,7 +1112,7 @@ contains
                                 do k = -buff_size, n + buff_size
                                     do j = -buff_size, m + buff_size
                                         do q = 1, nb
-                                            r = (i - 1) + (q - 1)*nnode + nb*nnode + v_size*((j + buff_size) + (m + 2*buff_size &
+                                            r = r_off + (i - 1) + (q - 1)*nnode + nb*nnode + v_size*((j + buff_size) + (m + 2*buff_size &
                                                  & + 1)*((k + buff_size) + (n + 2*buff_size + 1)*(l + buff_size)))
                                             mv_in(j, k, l + unpack_offset, i - nVar, q) = real(buff_recv(r), kind=stp)
                                         end do
@@ -1063,9 +1126,136 @@ contains
             end if
         #:endfor
         call nvtxEndRange
+
+    end subroutine s_mpi_unpack_face_buffer
+
+    !> Nonblocking halo exchange for the two faces of one coordinate direction (halo_nonblocking). The caller drives
+    !! directions in x, y, z order so corner ghost data propagates exactly as in the blocking path, while the two
+    !! faces of the active direction overlap their handshake latency through Irecv/Isend + Waitall. Each face owns a
+    !! private segment of buff_send/buff_recv of halo_size + 1 elements, indexed by 2*(mpi_dir - 1) + loc index.
+    subroutine s_mpi_nb_direction_buffers(q_comm, mpi_dir, nVar, face_is_mpi, pb_in, mv_in, q_T_sf)
+
+        type(scalar_field), dimension(1:), intent(inout) :: q_comm
+        real(stp), optional, dimension(idwbuff(1)%beg:,idwbuff(2)%beg:,idwbuff(3)%beg:,1:,1:), intent(inout) :: pb_in, mv_in
+        integer, intent(in) :: mpi_dir, nVar
+        logical, dimension(2), intent(in) :: face_is_mpi
+        type(scalar_field), optional, intent(inout) :: q_T_sf
+
+#ifdef MFC_MPI
+        integer :: idx, loc, nreq, ierr
+        integer :: reqs(1:4)
+        logical :: qbmm_comm(1:2), chem_diff_comm(1:2)
+        integer :: buffer_count(1:2), dst_proc(1:2), src_proc(1:2), send_tag(1:2), recv_tag(1:2)
+        integer :: pack_offset(1:2), unpack_offset(1:2), seg_off(1:2)
+
+        do idx = 1, 2
+            if (.not. face_is_mpi(idx)) cycle
+            loc = 2*idx - 3
+            call s_mpi_setup_face_exchange(nVar, mpi_dir, loc, qbmm_comm(idx), chem_diff_comm(idx), buffer_count(idx), &
+                                           & dst_proc(idx), src_proc(idx), send_tag(idx), recv_tag(idx), pack_offset(idx), &
+                                           & unpack_offset(idx), pb_in, mv_in, q_T_sf)
+            seg_off(idx) = (2*(mpi_dir - 1) + idx - 1)*(halo_size + 1)
+        end do
+
+        nreq = 0
+        ! Send/Recv: Irecvs go up before packing so the two faces' handshakes overlap
+        #:for rdma_mpi in [False, True]
+            if (use_rdma_transport .eqv. ${'.true.' if rdma_mpi else '.false.'}$) then
+                #:if rdma_mpi
+                    #:call GPU_HOST_DATA(use_device_addr='[buff_recv]')
+                        call nvtxStartRange("RHS-COMM-IRECV")
+                        do idx = 1, 2
+                            if (face_is_mpi(idx)) then
+                                nreq = nreq + 1
+                                call MPI_IRECV(buff_recv(seg_off(idx)), buffer_count(idx), mpi_p, src_proc(idx), &
+                                               & recv_tag(idx), MPI_COMM_WORLD, reqs(nreq), ierr)
+                            end if
+                        end do
+                        call nvtxEndRange
+                    #:endcall GPU_HOST_DATA
+
+                    do idx = 1, 2
+                        if (face_is_mpi(idx)) then
+                            call s_mpi_pack_face_buffer(q_comm, mpi_dir, pack_offset(idx), nVar, seg_off(idx), &
+                                                        & qbmm_comm(idx), chem_diff_comm(idx), pb_in, mv_in, q_T_sf)
+                        end if
+                    end do
+
+                    #:call GPU_HOST_DATA(use_device_addr='[buff_send]')
+                        call nvtxStartRange("RHS-COMM-ISEND")
+                        do idx = 1, 2
+                            if (face_is_mpi(idx)) then
+                                nreq = nreq + 1
+                                call MPI_ISEND(buff_send(seg_off(idx)), buffer_count(idx), mpi_p, dst_proc(idx), &
+                                               & send_tag(idx), MPI_COMM_WORLD, reqs(nreq), ierr)
+                            end if
+                        end do
+                        call nvtxEndRange
+                    #:endcall GPU_HOST_DATA
+                #:else
+                    call nvtxStartRange("RHS-COMM-IRECV")
+                    do idx = 1, 2
+                        if (face_is_mpi(idx)) then
+                            nreq = nreq + 1
+                            call MPI_IRECV(buff_recv(seg_off(idx)), buffer_count(idx), mpi_p, src_proc(idx), &
+                                           & recv_tag(idx), MPI_COMM_WORLD, reqs(nreq), ierr)
+                        end if
+                    end do
+                    call nvtxEndRange
+
+                    do idx = 1, 2
+                        if (face_is_mpi(idx)) then
+                            call s_mpi_pack_face_buffer(q_comm, mpi_dir, pack_offset(idx), nVar, seg_off(idx), &
+                                                        & qbmm_comm(idx), chem_diff_comm(idx), pb_in, mv_in, q_T_sf)
+                        end if
+                    end do
+
+                    call nvtxStartRange("RHS-COMM-DEV2HOST")
+                    do idx = 1, 2
+                        if (face_is_mpi(idx)) then
+                            $:GPU_UPDATE(host='[buff_send(seg_off(idx):seg_off(idx)+buffer_count(idx)-1)]')
+                        end if
+                    end do
+                    call nvtxEndRange
+
+                    call nvtxStartRange("RHS-COMM-ISEND")
+                    do idx = 1, 2
+                        if (face_is_mpi(idx)) then
+                            nreq = nreq + 1
+                            call MPI_ISEND(buff_send(seg_off(idx)), buffer_count(idx), mpi_p, dst_proc(idx), &
+                                           & send_tag(idx), MPI_COMM_WORLD, reqs(nreq), ierr)
+                        end if
+                    end do
+                    call nvtxEndRange
+                #:endif
+
+                call nvtxStartRange("RHS-COMM-WAITALL")
+                call MPI_WAITALL(nreq, reqs, MPI_STATUSES_IGNORE, ierr)
+                call nvtxEndRange
+
+                #:if rdma_mpi
+                    $:GPU_WAIT()
+                #:else
+                    call nvtxStartRange("RHS-COMM-HOST2DEV")
+                    do idx = 1, 2
+                        if (face_is_mpi(idx)) then
+                            $:GPU_UPDATE(device='[buff_recv(seg_off(idx):seg_off(idx)+buffer_count(idx)-1)]')
+                        end if
+                    end do
+                    call nvtxEndRange
+                #:endif
+
+                do idx = 1, 2
+                    if (face_is_mpi(idx)) then
+                        call s_mpi_unpack_face_buffer(q_comm, mpi_dir, unpack_offset(idx), nVar, seg_off(idx), &
+                                                      & qbmm_comm(idx), chem_diff_comm(idx), pb_in, mv_in, q_T_sf)
+                    end if
+                end do
+            end if
+        #:endfor
 #endif
 
-    end subroutine s_mpi_sendrecv_variables_buffers
+    end subroutine s_mpi_nb_direction_buffers
 
     !> The goal of this procedure is to populate the buffers of the cell-average conservative variables by communicating with the
     !! neighboring processors.
